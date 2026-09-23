@@ -4,7 +4,7 @@
 """Functional API for ray operations on sparse grids."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -378,3 +378,582 @@ def rays_intersect_voxels_single(
     )
     did_hit = (ray_times.joffsets[1:] - ray_times.joffsets[:-1]) > 0
     return did_hit
+
+
+# ---------------------------------------------------------------------------
+#  SDF surface points (trilinear interpolant)
+# ---------------------------------------------------------------------------
+
+
+_REFINE_MODES = {"newton": 0, "bisect": 1}
+_GRAZE_MODES = {"analytic": 0, "bisect": 1}
+
+
+def _mode(value: str, table: dict[str, int], name: str) -> int:
+    """Validate a solver-method argument, failing by name rather than deep in the kernel."""
+    try:
+        return table[value]
+    except KeyError:
+        raise ValueError(f"{name} must be one of {sorted(table)}, got {value!r}") from None
+
+
+class RaySdfPoint(NamedTuple):
+    """One surface point per ray, with the SDF sampled there.
+
+    ``position``, ``t`` and ``mask`` are always detached: they describe *where* the point is,
+    which is a geometric query, not a differentiable function of the SDF values. ``sdf`` and
+    ``grad`` are differentiable with respect to the SDF values when those require grad; the
+    backward is attached only for rays that found a point, the others carry zeros with no
+    history.
+    """
+
+    t: torch.Tensor  # (N,)    ray parameter of the point
+    mask: torch.Tensor  # (N,)    whether a point was found and accepted
+    position: torch.Tensor  # (N, 3) ray_origins + t * ray_directions
+    sdf: torch.Tensor  # (N,)    SDF at the point
+    grad: torch.Tensor  # (N, 3) spatial SDF gradient at the point
+
+
+class RaySdfPoints(NamedTuple):
+    """Both surface points per ray, from a single traversal."""
+
+    crossing: RaySdfPoint
+    grazing: RaySdfPoint
+
+
+class _RaySdfPointValuesFn(torch.autograd.Function):
+    """Attach autograd to the values the kernel already computed.
+
+    Forward is a pass-through. The kernel evaluated the SDF and its spatial gradient while it
+    had the voxel's stencil in registers, and those values are exact, so there is nothing to
+    recompute -- only the backward is new. That backward is the same scatter
+    ``sample_trilinear_with_grad`` uses, evaluated at the *detached* points, which is the
+    correct derivative precisely because the points are not differentiable.
+    """
+
+    @staticmethod
+    def forward(ctx, voxel_data, grid_data, pts_impl, value, gradient):
+        ctx.grid_data = grid_data
+        ctx.pts_impl = pts_impl
+        ctx.save_for_backward(voxel_data)
+        return value, gradient
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: torch.Tensor | None) -> tuple[torch.Tensor | None, ...]:
+        grad_value, grad_gradient = grad_outputs
+        (voxel_data,) = ctx.saved_tensors
+        if grad_value is None:
+            grad_value = torch.zeros(voxel_data.new_empty(0).shape)  # pragma: no cover
+        # Match the layouts sample_trilinear_with_grad produces: (M, C) and (M, C, 3).
+        grad_data = _fvdb_cpp.sample_trilinear_with_grad_bwd(
+            ctx.grid_data,
+            ctx.pts_impl,
+            voxel_data,
+            grad_value.unsqueeze(-1).contiguous(),
+            grad_gradient.unsqueeze(1).contiguous(),
+        )
+        return grad_data, None, None, None, None
+
+
+def _sdf_point(
+    sdf: torch.Tensor,
+    ray_origins: torch.Tensor,
+    ray_directions: torch.Tensor,
+    times: torch.Tensor,
+    mask: torch.Tensor,
+    sdf_vals: torch.Tensor,
+    grads: torch.Tensor,
+    grid_data,
+    make_pts_impl,
+) -> RaySdfPoint:
+    """Assemble one output slot, making the SDF value and gradient differentiable.
+
+    Works on flat tensors only, so the single and batch variants share it: the batch wrapper
+    passes ``.jdata`` and re-wraps the result. The only difference between them is how the
+    points are wrapped for the C++ layer, which is what ``make_pts_impl`` supplies.
+
+    The kernel's own values are returned -- nothing is re-evaluated. When the SDF requires grad
+    they are routed through :class:`_RaySdfPointValuesFn` so a backward exists; when it does not
+    (the common geometry-only path, e.g. under ``torch.no_grad``) they are passed straight out.
+
+    ``make_pts_impl(points, ray_index)`` wraps a subset of the points for the C++ layer;
+    ``ray_index`` says which rays they belong to, which the batch variant needs to keep each
+    point with its grid.
+    """
+    position = ray_origins + times.unsqueeze(-1) * ray_directions
+
+    if sdf.requires_grad and torch.is_grad_enabled():
+        # Only the rays that found a point get an autograd node. The backward is a stencil
+        # scatter per point, so running it over every ray would cost the full ray count while
+        # the misses -- which carry the ray origin as their "position" -- must contribute
+        # nothing anyway. Compact to the accepted rows, attach the node there, scatter back.
+        idx = mask.nonzero(as_tuple=True)[0]
+        vals_hit, grads_hit = _RaySdfPointValuesFn.apply(
+            sdf.unsqueeze(-1),
+            grid_data,
+            make_pts_impl(position[idx].contiguous(), idx),
+            sdf_vals[idx],
+            grads[idx],
+        )
+        sdf_vals = torch.zeros_like(sdf_vals).index_put((idx,), vals_hit)
+        grads = torch.zeros_like(grads).index_put((idx,), grads_hit)
+
+    return RaySdfPoint(t=times, mask=mask, position=position, sdf=sdf_vals, grad=grads)
+
+
+def ray_sdf_intersection_single(
+    grid: Grid,
+    sdf: torch.Tensor,
+    ray_origins: torch.Tensor,
+    ray_directions: torch.Tensor,
+    t_min: float = 1e-4,
+    eps: float = 1e-4,
+    refine: str = "bisect",
+) -> RaySdfPoint:
+    """First zero crossing of the trilinearly interpolated SDF along each ray.
+
+    Each cell's crossing is bracketed from the cubic the SDF traces along the ray inside it,
+    split at the cubic's turning points, so a surface thinner than a cell is still seen;
+    ``refine`` only selects how the bracketed crossing is refined. A sign change in either direction
+    counts, so rays that start inside the surface report their exit.
+
+    Args:
+        grid (Grid): The grid the SDF is stored on: the **dual** of the geometry grid, e.g.
+            ``geometry_grid.dual_grid()``.
+        sdf (torch.Tensor): One SDF value per voxel of the grid.
+        ray_origins (torch.Tensor): Ray origins, shape ``(N, 3)``.
+        ray_directions (torch.Tensor): Ray directions, shape ``(N, 3)``. Assumed normalized, so
+            ``t`` is a world-space distance.
+        t_min (float): Earliest accepted crossing. Default ``1e-4``.
+        eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+        refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8 halvings
+            on the sign of the cell's cubic, to 1/256 of the bracket) or ``"newton"`` (safeguarded
+            Newton, to float precision). Both bracket every crossing from the cubic, so a surface
+            thinner than a voxel is seen.
+
+    Returns:
+        crossing (RaySdfPoint): The hit point, its SDF value and gradient.
+
+    .. seealso:: :func:`ray_sdf_grazing_single`, :func:`ray_sdf_intersection_with_grazing_single`
+    """
+    times, mask, sdf_vals, grads = _fvdb_cpp.ray_sdf_intersection(
+        grid.data,
+        JaggedTensor(ray_origins)._impl,
+        JaggedTensor(ray_directions)._impl,
+        JaggedTensor(sdf)._impl,
+        t_min,
+        eps,
+        _mode(refine, _REFINE_MODES, "refine"),
+    )
+    return _sdf_point(
+        sdf,
+        ray_origins,
+        ray_directions,
+        times.jdata[:, 0],
+        mask.jdata[:, 0],
+        sdf_vals.jdata[:, 0],
+        grads.jdata[:, 0, :],
+        grid.data,
+        lambda pts, idx: JaggedTensor(pts)._impl,
+    )
+
+
+def ray_sdf_grazing_single(
+    grid: Grid,
+    sdf: torch.Tensor,
+    ray_origins: torch.Tensor,
+    ray_directions: torch.Tensor,
+    relaxation_eps: float,
+    t_max: torch.Tensor | None = None,
+    ray_mask: torch.Tensor | None = None,
+    graze_t_min: float = 1e-4,
+    itx_eps: float = 1e-7,
+    deriv_eps: float = 1e-1,
+    eps: float = 1e-4,
+    graze: str = "bisect",
+) -> RaySdfPoint:
+    """Grazing point: the local minimum of the SDF along each ray inside the relaxation band.
+
+    The point where the SDF along the ray stops approaching and starts receding, i.e. where
+    the directional derivative crosses zero from negative to positive. Inside a cell that
+    derivative is a quadratic and is solved exactly; because the interpolant is C0 but not
+    C1, a minimum can also sit exactly on a cell face, and those are detected separately.
+
+    This is the relaxed silhouette of the relaxed-boundary method (Wang et al. 2025): rays that
+    pass within ``relaxation_eps`` of the surface without hitting it, rather than exactly
+    tangent rays. The boundary term weights each such point by ``-SDF / relaxation_eps``.
+
+    A candidate is accepted only when ``itx_eps < SDF < relaxation_eps`` and the surface is
+    near-tangent to the ray. The lower bound is not zero on purpose: ``SDF == 0`` is the
+    surface itself, so such a point is a tangential hit belonging to the interior term, and
+    testing against a bare zero lets rounding flip points between the two sets.
+
+    Args:
+        grid (Grid): The grid the SDF is stored on: the **dual** of the geometry grid, e.g.
+            ``geometry_grid.dual_grid()``.
+        sdf (torch.Tensor): One SDF value per voxel of the grid.
+        ray_origins (torch.Tensor): Ray origins, shape ``(N, 3)``.
+        ray_directions (torch.Tensor): Ray directions, shape ``(N, 3)``. Assumed normalized, so
+            ``t`` is a world-space distance.
+        relaxation_eps (float): Upper edge of the band a grazing point's SDF must lie in.
+        t_max (torch.Tensor | None): Optional per-ray search bound, shape ``(N,)``, typically
+            the first hit. Default ``None`` (unbounded).
+        ray_mask (torch.Tensor | None): Optional per-ray boolean enable, shape ``(N,)``. Default
+            ``None`` (all rays).
+        graze_t_min (float): Earliest accepted grazing point, to keep the search off the ray
+            origin. Default ``1e-4``.
+        itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
+            Default ``1e-7``.
+        deriv_eps (float): Tangency tolerance: a grazing point needs
+            ``|normalize(grad) . direction|`` below this. Default ``0.1``.
+        eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
+            minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
+            judges tangency from the average of the gradients at the two ends of the final
+            bracket -- at a cell face that is the average of the two one-sided slopes, matching
+            the relaxed-boundary reference implementation's central-difference gradient) or
+            ``"analytic"`` (solves each cell's derivative quadratic exactly, including minima on
+            cell faces).
+
+    Returns:
+        grazing (RaySdfPoint): The grazing point, its SDF value and gradient.
+
+    .. seealso:: :func:`ray_sdf_intersection_single`, :func:`ray_sdf_intersection_with_grazing_single`
+    """
+    times, mask, sdf_vals, grads = _fvdb_cpp.ray_sdf_grazing(
+        grid.data,
+        JaggedTensor(ray_origins)._impl,
+        JaggedTensor(ray_directions)._impl,
+        JaggedTensor(sdf)._impl,
+        None if t_max is None else JaggedTensor(t_max)._impl,
+        None if ray_mask is None else JaggedTensor(ray_mask)._impl,
+        graze_t_min,
+        relaxation_eps,
+        itx_eps,
+        deriv_eps,
+        eps,
+        _mode(graze, _GRAZE_MODES, "graze"),
+    )
+    return _sdf_point(
+        sdf,
+        ray_origins,
+        ray_directions,
+        times.jdata[:, 0],
+        mask.jdata[:, 0],
+        sdf_vals.jdata[:, 0],
+        grads.jdata[:, 0, :],
+        grid.data,
+        lambda pts, idx: JaggedTensor(pts)._impl,
+    )
+
+
+def ray_sdf_intersection_with_grazing_single(
+    grid: Grid,
+    sdf: torch.Tensor,
+    ray_origins: torch.Tensor,
+    ray_directions: torch.Tensor,
+    relaxation_eps: float,
+    t_min: float = 1e-4,
+    graze_t_min: float = 1e-4,
+    itx_eps: float = 1e-7,
+    deriv_eps: float = 1e-1,
+    eps: float = 1e-4,
+    refine: str = "bisect",
+    graze: str = "bisect",
+) -> RaySdfPoints:
+    """Both the first crossing and the grazing point, from a single traversal.
+
+    The grazing point is the relaxed-silhouette point of the relaxed-boundary method, see
+    :func:`ray_sdf_grazing_single`.
+
+    Cheaper than calling :func:`ray_sdf_intersection_single` and
+    :func:`ray_sdf_grazing_single` separately, for two reasons: the crossing search reuses
+    the derivative roots the grazing search already computes, and marching in ray order means
+    every grazing candidate found before the march stops at the crossing is automatically in
+    front of the surface -- so no separate ``t_max`` is needed or accepted here.
+
+    Args:
+        grid (Grid): The grid the SDF is stored on: the **dual** of the geometry grid, e.g.
+            ``geometry_grid.dual_grid()``.
+        sdf (torch.Tensor): One SDF value per voxel of the grid.
+        ray_origins (torch.Tensor): Ray origins, shape ``(N, 3)``.
+        ray_directions (torch.Tensor): Ray directions, shape ``(N, 3)``. Assumed normalized, so
+            ``t`` is a world-space distance.
+        relaxation_eps (float): Upper edge of the band a grazing point's SDF must lie in.
+        t_min (float): Earliest accepted crossing. Default ``1e-4``.
+        graze_t_min (float): Earliest accepted grazing point, to keep the search off the ray
+            origin. Default ``1e-4``.
+        itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
+            Default ``1e-7``.
+        deriv_eps (float): Tangency tolerance: a grazing point needs
+            ``|normalize(grad) . direction|`` below this. Default ``0.1``.
+        eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+        refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8 halvings
+            on the sign of the cell's cubic, to 1/256 of the bracket) or ``"newton"`` (safeguarded
+            Newton, to float precision). Both bracket every crossing from the cubic, so a surface
+            thinner than a voxel is seen.
+        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
+            minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
+            judges tangency from the average of the gradients at the two ends of the final
+            bracket -- at a cell face that is the average of the two one-sided slopes, matching
+            the relaxed-boundary reference implementation's central-difference gradient) or
+            ``"analytic"`` (solves each cell's derivative quadratic exactly, including minima on
+            cell faces).
+
+    Returns:
+        points (RaySdfPoints): ``.crossing`` and ``.grazing``, each a
+        :class:`RaySdfPoint`.
+
+    .. seealso:: :func:`ray_sdf_intersection_single`, :func:`ray_sdf_grazing_single`
+    """
+    times, mask, sdf_vals, grads = _fvdb_cpp.ray_sdf_intersection_with_grazing(
+        grid.data,
+        JaggedTensor(ray_origins)._impl,
+        JaggedTensor(ray_directions)._impl,
+        JaggedTensor(sdf)._impl,
+        t_min,
+        graze_t_min,
+        relaxation_eps,
+        itx_eps,
+        deriv_eps,
+        eps,
+        _mode(refine, _REFINE_MODES, "refine"),
+        _mode(graze, _GRAZE_MODES, "graze"),
+    )
+    t, m, s, g = times.jdata, mask.jdata, sdf_vals.jdata, grads.jdata
+    pts_impl = lambda pts, idx: JaggedTensor(pts)._impl
+    return RaySdfPoints(
+        crossing=_sdf_point(
+            sdf, ray_origins, ray_directions, t[:, 0], m[:, 0], s[:, 0], g[:, 0, :], grid.data, pts_impl
+        ),
+        grazing=_sdf_point(
+            sdf, ray_origins, ray_directions, t[:, 1], m[:, 1], s[:, 1], g[:, 1, :], grid.data, pts_impl
+        ),
+    )
+
+
+def _sdf_point_batch(
+    grid: GridBatch,
+    sdf: JaggedTensor,
+    ray_origins: JaggedTensor,
+    ray_directions: JaggedTensor,
+    times: torch.Tensor,
+    mask: torch.Tensor,
+    sdf_vals: torch.Tensor,
+    grads: torch.Tensor,
+) -> RaySdfPoint:
+    """Batch counterpart of :func:`_sdf_point`: run it flat, then re-wrap as JaggedTensors.
+
+    The rays of a batch are stored concatenated in ``.jdata``, so every operation in
+    :func:`_sdf_point` is elementwise-correct on the flat form and only the wrapping differs.
+    """
+    point = _sdf_point(
+        sdf.jdata,
+        ray_origins.jdata,
+        ray_directions.jdata,
+        times,
+        mask,
+        sdf_vals,
+        grads,
+        grid.data,
+        # A compacted subset no longer matches the batch's offsets, so rebuild the jagged
+        # structure from the rays the points came from.
+        lambda pts, idx: JaggedTensor.from_data_and_indices(pts, ray_origins.jidx[idx], ray_origins.num_tensors)._impl,
+    )
+    return RaySdfPoint(*(ray_origins.jagged_like(field) for field in point))
+
+
+def ray_sdf_intersection_batch(
+    grid: GridBatch,
+    sdf: JaggedTensor,
+    ray_origins: JaggedTensor,
+    ray_directions: JaggedTensor,
+    t_min: float = 1e-4,
+    eps: float = 1e-4,
+    refine: str = "bisect",
+) -> RaySdfPoint:
+    """Batched :func:`ray_sdf_intersection_single`.
+
+    Args:
+        grid (GridBatch): The grid batch the SDF is stored on: the **dual** of the geometry grid
+            batch, e.g. ``geometry_batch.dual_grid()``.
+        sdf (JaggedTensor): One SDF value per voxel of the grid.
+        ray_origins (JaggedTensor): Ray origins, shape ``(B, -1, 3)``.
+        ray_directions (JaggedTensor): Ray directions, shape ``(B, -1, 3)``. Assumed normalized,
+            so ``t`` is a world-space distance.
+        t_min (float): Earliest accepted crossing. Default ``1e-4``.
+        eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+        refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8 halvings
+            on the sign of the cell's cubic, to 1/256 of the bracket) or ``"newton"`` (safeguarded
+            Newton, to float precision). Both bracket every crossing from the cubic, so a surface
+            thinner than a voxel is seen.
+
+    Returns:
+        crossing (RaySdfPoint): Fields are :class:`JaggedTensor` rather than ``torch.Tensor``.
+
+    .. seealso:: :func:`ray_sdf_intersection_single`
+    """
+    times, mask, sdf_vals, grads = _fvdb_cpp.ray_sdf_intersection(
+        grid.data,
+        ray_origins._impl,
+        ray_directions._impl,
+        sdf._impl,
+        t_min,
+        eps,
+        _mode(refine, _REFINE_MODES, "refine"),
+    )
+    return _sdf_point_batch(
+        grid,
+        sdf,
+        ray_origins,
+        ray_directions,
+        times.jdata[:, 0],
+        mask.jdata[:, 0],
+        sdf_vals.jdata[:, 0],
+        grads.jdata[:, 0, :],
+    )
+
+
+def ray_sdf_grazing_batch(
+    grid: GridBatch,
+    sdf: JaggedTensor,
+    ray_origins: JaggedTensor,
+    ray_directions: JaggedTensor,
+    relaxation_eps: float,
+    t_max: JaggedTensor | None = None,
+    ray_mask: JaggedTensor | None = None,
+    graze_t_min: float = 1e-4,
+    itx_eps: float = 1e-7,
+    deriv_eps: float = 1e-1,
+    eps: float = 1e-4,
+    graze: str = "bisect",
+) -> RaySdfPoint:
+    """Batched :func:`ray_sdf_grazing_single`.
+
+    Args:
+        grid (GridBatch): The grid batch the SDF is stored on: the **dual** of the geometry grid
+            batch, e.g. ``geometry_batch.dual_grid()``.
+        sdf (JaggedTensor): One SDF value per voxel of the grid.
+        ray_origins (JaggedTensor): Ray origins, shape ``(B, -1, 3)``.
+        ray_directions (JaggedTensor): Ray directions, shape ``(B, -1, 3)``. Assumed normalized,
+            so ``t`` is a world-space distance.
+        relaxation_eps (float): Upper edge of the band a grazing point's SDF must lie in.
+        t_max (JaggedTensor | None): Optional per-ray search bound, shape ``(B, -1)``, typically
+            the first hit. Default ``None`` (unbounded).
+        ray_mask (JaggedTensor | None): Optional per-ray boolean enable, shape ``(B, -1)``.
+            Default ``None`` (all rays).
+        graze_t_min (float): Earliest accepted grazing point, to keep the search off the ray
+            origin. Default ``1e-4``.
+        itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
+            Default ``1e-7``.
+        deriv_eps (float): Tangency tolerance: a grazing point needs
+            ``|normalize(grad) . direction|`` below this. Default ``0.1``.
+        eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
+            minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
+            judges tangency from the average of the gradients at the two ends of the final
+            bracket -- at a cell face that is the average of the two one-sided slopes, matching
+            the relaxed-boundary reference implementation's central-difference gradient) or
+            ``"analytic"`` (solves each cell's derivative quadratic exactly, including minima on
+            cell faces).
+
+    Returns:
+        grazing (RaySdfPoint): Fields are :class:`JaggedTensor` rather than ``torch.Tensor``.
+
+    .. seealso:: :func:`ray_sdf_grazing_single`
+    """
+    times, mask, sdf_vals, grads = _fvdb_cpp.ray_sdf_grazing(
+        grid.data,
+        ray_origins._impl,
+        ray_directions._impl,
+        sdf._impl,
+        None if t_max is None else t_max._impl,
+        None if ray_mask is None else ray_mask._impl,
+        graze_t_min,
+        relaxation_eps,
+        itx_eps,
+        deriv_eps,
+        eps,
+        _mode(graze, _GRAZE_MODES, "graze"),
+    )
+    return _sdf_point_batch(
+        grid,
+        sdf,
+        ray_origins,
+        ray_directions,
+        times.jdata[:, 0],
+        mask.jdata[:, 0],
+        sdf_vals.jdata[:, 0],
+        grads.jdata[:, 0, :],
+    )
+
+
+def ray_sdf_intersection_with_grazing_batch(
+    grid: GridBatch,
+    sdf: JaggedTensor,
+    ray_origins: JaggedTensor,
+    ray_directions: JaggedTensor,
+    relaxation_eps: float,
+    t_min: float = 1e-4,
+    graze_t_min: float = 1e-4,
+    itx_eps: float = 1e-7,
+    deriv_eps: float = 1e-1,
+    eps: float = 1e-4,
+    refine: str = "bisect",
+    graze: str = "bisect",
+) -> RaySdfPoints:
+    """Batched :func:`ray_sdf_intersection_with_grazing_single`.
+
+    Args:
+        grid (GridBatch): The grid batch the SDF is stored on: the **dual** of the geometry grid
+            batch, e.g. ``geometry_batch.dual_grid()``.
+        sdf (JaggedTensor): One SDF value per voxel of the grid.
+        ray_origins (JaggedTensor): Ray origins, shape ``(B, -1, 3)``.
+        ray_directions (JaggedTensor): Ray directions, shape ``(B, -1, 3)``. Assumed normalized,
+            so ``t`` is a world-space distance.
+        relaxation_eps (float): Upper edge of the band a grazing point's SDF must lie in.
+        t_min (float): Earliest accepted crossing. Default ``1e-4``.
+        graze_t_min (float): Earliest accepted grazing point, to keep the search off the ray
+            origin. Default ``1e-4``.
+        itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
+            Default ``1e-7``.
+        deriv_eps (float): Tangency tolerance: a grazing point needs
+            ``|normalize(grad) . direction|`` below this. Default ``0.1``.
+        eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+        refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8 halvings
+            on the sign of the cell's cubic, to 1/256 of the bracket) or ``"newton"`` (safeguarded
+            Newton, to float precision). Both bracket every crossing from the cubic, so a surface
+            thinner than a voxel is seen.
+        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
+            minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
+            judges tangency from the average of the gradients at the two ends of the final
+            bracket -- at a cell face that is the average of the two one-sided slopes, matching
+            the relaxed-boundary reference implementation's central-difference gradient) or
+            ``"analytic"`` (solves each cell's derivative quadratic exactly, including minima on
+            cell faces).
+
+    Returns:
+        points (RaySdfPoints): ``.crossing`` and ``.grazing``, whose fields are
+        :class:`JaggedTensor` rather than ``torch.Tensor``.
+
+    .. seealso:: :func:`ray_sdf_intersection_with_grazing_single`
+    """
+    times, mask, sdf_vals, grads = _fvdb_cpp.ray_sdf_intersection_with_grazing(
+        grid.data,
+        ray_origins._impl,
+        ray_directions._impl,
+        sdf._impl,
+        t_min,
+        graze_t_min,
+        relaxation_eps,
+        itx_eps,
+        deriv_eps,
+        eps,
+        _mode(refine, _REFINE_MODES, "refine"),
+        _mode(graze, _GRAZE_MODES, "graze"),
+    )
+    t, m, s, g = times.jdata, mask.jdata, sdf_vals.jdata, grads.jdata
+    return RaySdfPoints(
+        crossing=_sdf_point_batch(grid, sdf, ray_origins, ray_directions, t[:, 0], m[:, 0], s[:, 0], g[:, 0, :]),
+        grazing=_sdf_point_batch(grid, sdf, ray_origins, ray_directions, t[:, 1], m[:, 1], s[:, 1], g[:, 1, :]),
+    )

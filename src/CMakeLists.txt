@@ -130,6 +130,9 @@ set(FVDB_CU_FILES
     fvdb/detail/ops/PointsInGrid.cu
     fvdb/detail/ops/PopulateGridMetadata.cu
     fvdb/detail/ops/RayImplicitIntersection.cu
+    fvdb/detail/ops/RaySdfGrazing.cu
+    fvdb/detail/ops/RaySdfIntersection.cu
+    fvdb/detail/ops/RaySdfIntersectionWithGrazing.cu
     fvdb/detail/ops/InjectFromDense.cu
     fvdb/detail/ops/InjectToDense.cu
     fvdb/detail/ops/SampleBezier.cu

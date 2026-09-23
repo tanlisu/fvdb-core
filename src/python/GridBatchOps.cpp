@@ -45,6 +45,9 @@
 
 // Rays
 #include <fvdb/detail/ops/RayImplicitIntersection.h>
+#include <fvdb/detail/ops/RaySdfGrazing.h>
+#include <fvdb/detail/ops/RaySdfIntersection.h>
+#include <fvdb/detail/ops/RaySdfIntersectionWithGrazing.h>
 #include <fvdb/detail/ops/SampleRaysUniform.h>
 #include <fvdb/detail/ops/SegmentsAlongRays.h>
 #include <fvdb/detail/ops/VoxelsAlongRays.h>
@@ -467,6 +470,113 @@ bind_grid_batch_ops(py::module &m) {
           py::arg("ray_directions"),
           py::arg("grid_scalars"),
           py::arg("eps"));
+
+    // The ray_sdf_* ops all return (times, mask, sdf, grad) with a trailing slot dimension;
+    // returned as a tuple rather than a bound struct so the Python layer can name the slots.
+    using RaySdfOut  = std::tuple<JT, JT, JT, JT>;
+    auto raySdfTuple = [](const ops::RaySdfPointsResult &r) -> RaySdfOut {
+        return std::make_tuple(r.times, r.mask, r.sdf, r.grad);
+    };
+
+    m.def(
+        "ray_sdf_intersection",
+        [raySdfTuple](const GBI &grid,
+                      const JT &rayOrigins,
+                      const JT &rayDirections,
+                      const JT &sdf,
+                      double tMin,
+                      double eps,
+                      int refine) -> RaySdfOut {
+            return raySdfTuple(
+                ops::raySdfIntersection(grid, rayOrigins, rayDirections, sdf, tMin, eps, refine));
+        },
+        py::arg("grid"),
+        py::arg("ray_origins"),
+        py::arg("ray_directions"),
+        py::arg("sdf"),
+        py::arg("t_min"),
+        py::arg("eps"),
+        py::arg("refine"));
+
+    m.def(
+        "ray_sdf_grazing",
+        [raySdfTuple](const GBI &grid,
+                      const JT &rayOrigins,
+                      const JT &rayDirections,
+                      const JT &sdf,
+                      const std::optional<JT> &tMax,
+                      const std::optional<JT> &rayMask,
+                      double grazeTMin,
+                      double relaxationEps,
+                      double itxEps,
+                      double derivEps,
+                      double eps,
+                      int graze) -> RaySdfOut {
+            return raySdfTuple(ops::raySdfGrazing(grid,
+                                                  rayOrigins,
+                                                  rayDirections,
+                                                  sdf,
+                                                  tMax,
+                                                  rayMask,
+                                                  grazeTMin,
+                                                  relaxationEps,
+                                                  itxEps,
+                                                  derivEps,
+                                                  eps,
+                                                  graze));
+        },
+        py::arg("grid"),
+        py::arg("ray_origins"),
+        py::arg("ray_directions"),
+        py::arg("sdf"),
+        py::arg("t_max"),
+        py::arg("ray_mask"),
+        py::arg("graze_t_min"),
+        py::arg("relaxation_eps"),
+        py::arg("itx_eps"),
+        py::arg("deriv_eps"),
+        py::arg("eps"),
+        py::arg("graze"));
+
+    m.def(
+        "ray_sdf_intersection_with_grazing",
+        [raySdfTuple](const GBI &grid,
+                      const JT &rayOrigins,
+                      const JT &rayDirections,
+                      const JT &sdf,
+                      double tMin,
+                      double grazeTMin,
+                      double relaxationEps,
+                      double itxEps,
+                      double derivEps,
+                      double eps,
+                      int refine,
+                      int graze) -> RaySdfOut {
+            return raySdfTuple(ops::raySdfIntersectionWithGrazing(grid,
+                                                                  rayOrigins,
+                                                                  rayDirections,
+                                                                  sdf,
+                                                                  tMin,
+                                                                  grazeTMin,
+                                                                  relaxationEps,
+                                                                  itxEps,
+                                                                  derivEps,
+                                                                  eps,
+                                                                  refine,
+                                                                  graze));
+        },
+        py::arg("grid"),
+        py::arg("ray_origins"),
+        py::arg("ray_directions"),
+        py::arg("sdf"),
+        py::arg("t_min"),
+        py::arg("graze_t_min"),
+        py::arg("relaxation_eps"),
+        py::arg("itx_eps"),
+        py::arg("deriv_eps"),
+        py::arg("eps"),
+        py::arg("refine"),
+        py::arg("graze"));
 
     // -----------------------------------------------------------------------
     // Meshing / TSDF

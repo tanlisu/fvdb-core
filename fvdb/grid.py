@@ -1260,6 +1260,194 @@ class Grid:
 
         return functional.ray_implicit_intersection_single(self, ray_origins, ray_directions, grid_scalars, eps)
 
+    def ray_sdf_intersection(
+        self,
+        sdf: torch.Tensor,
+        ray_origins: torch.Tensor,
+        ray_directions: torch.Tensor,
+        t_min: float = 1e-4,
+        eps: float = 1e-4,
+        refine: str = "bisect",
+    ) -> "functional.RaySdfPoint":
+        """Find the first zero crossing of the trilinearly interpolated SDF along each ray.
+
+        Unlike :meth:`ray_implicit_intersection`, which treats the field as constant per
+        voxel, this works on the trilinear interpolant itself: it brackets each crossing from
+        the cubic that interpolant traces along the ray inside each cell, so even a surface
+        thinner than a cell is found; ``refine`` only selects how the bracketed crossing is refined.
+
+        .. note:: ``self`` must be the grid the SDF lives on, i.e. the **dual** of the grid
+            defining the geometry -- call this on ``grid.dual_grid()``.
+
+        Args:
+            sdf (torch.Tensor): One SDF value per voxel of the grid.
+            ray_origins (torch.Tensor): Ray origins, shape ``(N, 3)``.
+            ray_directions (torch.Tensor): Ray directions, shape ``(N, 3)``. Assumed normalized,
+                so ``t`` is a world-space distance.
+            t_min (float): Earliest accepted crossing. Default ``1e-4``.
+            eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+            refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8
+                halvings on the sign of the cell's cubic, to 1/256 of the bracket) or
+                ``"newton"`` (safeguarded Newton, to float precision). Both bracket every
+                crossing from the cubic, so a surface thinner than a voxel is seen.
+
+        Returns:
+            crossing (RaySdfPoint): Hit parameter, mask, position, SDF and gradient.
+
+        .. seealso:: :meth:`ray_sdf_grazing`, :meth:`ray_sdf_intersection_with_grazing`
+        """
+        from . import functional
+
+        return functional.ray_sdf_intersection_single(self, sdf, ray_origins, ray_directions, t_min, eps, refine)
+
+    def ray_sdf_grazing(
+        self,
+        sdf: torch.Tensor,
+        ray_origins: torch.Tensor,
+        ray_directions: torch.Tensor,
+        relaxation_eps: float,
+        t_max: torch.Tensor | None = None,
+        ray_mask: torch.Tensor | None = None,
+        graze_t_min: float = 1e-4,
+        itx_eps: float = 1e-7,
+        deriv_eps: float = 1e-1,
+        eps: float = 1e-4,
+        graze: str = "bisect",
+    ) -> "functional.RaySdfPoint":
+        """Find where each ray grazes the surface without crossing it.
+
+        The grazing point is the relaxed silhouette of the relaxed-boundary method: a ray that
+        passes within ``relaxation_eps`` of the surface without hitting it, rather than an
+        exactly tangent ray. The boundary term weights it by ``-SDF / relaxation_eps``.
+
+        The local minimum of the SDF along the ray, i.e. where the directional derivative
+        crosses zero from negative to positive, accepted only when it lies inside the
+        relaxation band and the surface is near-tangent to the ray.
+
+        .. note:: ``self`` must be the dual grid; see :meth:`ray_sdf_intersection`.
+
+        Args:
+            sdf (torch.Tensor): One SDF value per voxel of the grid.
+            ray_origins (torch.Tensor): Ray origins, shape ``(N, 3)``.
+            ray_directions (torch.Tensor): Ray directions, shape ``(N, 3)``. Assumed normalized,
+                so ``t`` is a world-space distance.
+            relaxation_eps (float): Upper edge of the band a grazing point's SDF must lie in.
+            t_max (torch.Tensor | None): Optional per-ray search bound, shape ``(N,)``,
+                typically the first hit. Default ``None`` (unbounded).
+            ray_mask (torch.Tensor | None): Optional per-ray boolean enable, shape ``(N,)``.
+                Default ``None`` (all rays).
+            graze_t_min (float): Earliest accepted grazing point, to keep the search off the ray
+                origin. Default ``1e-4``.
+            itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
+                Default ``1e-7``.
+            deriv_eps (float): Tangency tolerance: a grazing point needs
+                ``|normalize(grad) . direction|`` below this. Default ``0.1``.
+            eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
+                minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
+                judges tangency from the average of the gradients at the two ends of the final
+                bracket -- at a cell face that is the average of the two one-sided slopes,
+                matching the relaxed-boundary reference implementation's central-difference
+                gradient) or ``"analytic"`` (solves each cell's derivative quadratic exactly,
+                including minima on cell faces).
+
+        Returns:
+            grazing (RaySdfPoint): Grazing parameter, mask, position, SDF and gradient.
+
+        .. seealso:: :meth:`ray_sdf_intersection`, :meth:`ray_sdf_intersection_with_grazing`
+        """
+        from . import functional
+
+        return functional.ray_sdf_grazing_single(
+            self,
+            sdf,
+            ray_origins,
+            ray_directions,
+            relaxation_eps,
+            t_max,
+            ray_mask,
+            graze_t_min,
+            itx_eps,
+            deriv_eps,
+            eps,
+            graze,
+        )
+
+    def ray_sdf_intersection_with_grazing(
+        self,
+        sdf: torch.Tensor,
+        ray_origins: torch.Tensor,
+        ray_directions: torch.Tensor,
+        relaxation_eps: float,
+        t_min: float = 1e-4,
+        graze_t_min: float = 1e-4,
+        itx_eps: float = 1e-7,
+        deriv_eps: float = 1e-1,
+        eps: float = 1e-4,
+        refine: str = "bisect",
+        graze: str = "bisect",
+    ) -> "functional.RaySdfPoints":
+        """Find both the first crossing and the grazing point in a single traversal.
+
+        The grazing point is the relaxed silhouette of the relaxed-boundary method: a ray that
+        passes within ``relaxation_eps`` of the surface without hitting it, rather than an
+        exactly tangent ray. The boundary term weights it by ``-SDF / relaxation_eps``.
+
+        Cheaper than calling :meth:`ray_sdf_intersection` and :meth:`ray_sdf_grazing`
+        separately: the two searches share the same per-cell derivative roots, and the
+        grazing search is bounded by the crossing for free because cells are visited in ray
+        order.
+
+        .. note:: ``self`` must be the dual grid; see :meth:`ray_sdf_intersection`.
+
+        Args:
+            sdf (torch.Tensor): One SDF value per voxel of the grid.
+            ray_origins (torch.Tensor): Ray origins, shape ``(N, 3)``.
+            ray_directions (torch.Tensor): Ray directions, shape ``(N, 3)``. Assumed normalized,
+                so ``t`` is a world-space distance.
+            relaxation_eps (float): Upper edge of the band a grazing point's SDF must lie in.
+            t_min (float): Earliest accepted crossing. Default ``1e-4``.
+            graze_t_min (float): Earliest accepted grazing point, to keep the search off the ray
+                origin. Default ``1e-4``.
+            itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
+                Default ``1e-7``.
+            deriv_eps (float): Tangency tolerance: a grazing point needs
+                ``|normalize(grad) . direction|`` below this. Default ``0.1``.
+            eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
+            refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8
+                halvings on the sign of the cell's cubic, to 1/256 of the bracket) or
+                ``"newton"`` (safeguarded Newton, to float precision). Both bracket every
+                crossing from the cubic, so a surface thinner than a voxel is seen.
+            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
+                minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
+                judges tangency from the average of the gradients at the two ends of the final
+                bracket -- at a cell face that is the average of the two one-sided slopes,
+                matching the relaxed-boundary reference implementation's central-difference
+                gradient) or ``"analytic"`` (solves each cell's derivative quadratic exactly,
+                including minima on cell faces).
+
+        Returns:
+            points (RaySdfPoints): ``.crossing`` and ``.grazing``.
+
+        .. seealso:: :meth:`ray_sdf_intersection`, :meth:`ray_sdf_grazing`
+        """
+        from . import functional
+
+        return functional.ray_sdf_intersection_with_grazing_single(
+            self,
+            sdf,
+            ray_origins,
+            ray_directions,
+            relaxation_eps,
+            t_min,
+            graze_t_min,
+            itx_eps,
+            deriv_eps,
+            eps,
+            refine,
+            graze,
+        )
+
     def rays_intersect_voxels(
         self,
         ray_origins: torch.Tensor,

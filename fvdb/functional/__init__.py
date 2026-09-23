@@ -133,8 +133,16 @@ from ._query import (
 
 # Ray operations
 from ._ray import (
+    RaySdfPoint,
+    RaySdfPoints,
     ray_implicit_intersection_batch,
     ray_implicit_intersection_single,
+    ray_sdf_grazing_batch,
+    ray_sdf_grazing_single,
+    ray_sdf_intersection_batch,
+    ray_sdf_intersection_single,
+    ray_sdf_intersection_with_grazing_batch,
+    ray_sdf_intersection_with_grazing_single,
     rays_intersect_voxels_batch,
     rays_intersect_voxels_single,
     segments_along_rays_batch,
@@ -261,6 +269,14 @@ __all__ = [
     "uniform_ray_samples_single",
     "ray_implicit_intersection_batch",
     "ray_implicit_intersection_single",
+    "ray_sdf_grazing_batch",
+    "ray_sdf_grazing_single",
+    "ray_sdf_intersection_batch",
+    "ray_sdf_intersection_single",
+    "ray_sdf_intersection_with_grazing_batch",
+    "ray_sdf_intersection_with_grazing_single",
+    "RaySdfPoint",
+    "RaySdfPoints",
     # Meshing
     "marching_cubes_batch",
     "marching_cubes_single",
