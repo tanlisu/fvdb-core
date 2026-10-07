@@ -509,7 +509,6 @@ bind_grid_batch_ops(py::module &m) {
                       double grazeTMin,
                       double relaxationEps,
                       double itxEps,
-                      double derivEps,
                       double eps,
                       int graze) -> RaySdfOut {
             return raySdfTuple(ops::raySdfGrazing(grid,
@@ -521,7 +520,6 @@ bind_grid_batch_ops(py::module &m) {
                                                   grazeTMin,
                                                   relaxationEps,
                                                   itxEps,
-                                                  derivEps,
                                                   eps,
                                                   graze));
         },
@@ -534,7 +532,6 @@ bind_grid_batch_ops(py::module &m) {
         py::arg("graze_t_min"),
         py::arg("relaxation_eps"),
         py::arg("itx_eps"),
-        py::arg("deriv_eps"),
         py::arg("eps"),
         py::arg("graze"));
 
@@ -548,7 +545,6 @@ bind_grid_batch_ops(py::module &m) {
                       double grazeTMin,
                       double relaxationEps,
                       double itxEps,
-                      double derivEps,
                       double eps,
                       int refine,
                       int graze) -> RaySdfOut {
@@ -560,7 +556,6 @@ bind_grid_batch_ops(py::module &m) {
                                                                   grazeTMin,
                                                                   relaxationEps,
                                                                   itxEps,
-                                                                  derivEps,
                                                                   eps,
                                                                   refine,
                                                                   graze));
@@ -573,7 +568,6 @@ bind_grid_batch_ops(py::module &m) {
         py::arg("graze_t_min"),
         py::arg("relaxation_eps"),
         py::arg("itx_eps"),
-        py::arg("deriv_eps"),
         py::arg("eps"),
         py::arg("refine"),
         py::arg("graze"));

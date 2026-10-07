@@ -183,9 +183,8 @@ class RaySdfSampledReferenceTests(unittest.TestCase):
     differences, each matching the relaxed-boundary reference implementation instead: crossings
     are bracketed from each cell's cubic (so features thinner than a voxel are seen; on this
     smooth shell the two agree to bisection precision), the root rather than the bracket is
-    tested against t_min, and tangency is judged from the average of the gradients at the two
-    ends of the final bracket instead of one side. The
-    reference below is written against fvdb's own voxels_along_rays and sample_trilinear, not
+    tested against t_min, and the grazing point has no tangency test (the bracket always holds a
+    minimum along the ray; only its SDF value is checked). The reference below is written against fvdb's own voxels_along_rays and sample_trilinear, not
     against the kernel, and runs on a pruned spherical shell so rays leave and re-enter the band.
     """
 
@@ -251,7 +250,7 @@ class RaySdfSampledReferenceTests(unittest.TestCase):
                     return t
         return None
 
-    def _ref_grazing(self, i, eps, graze_t_min, itx_eps, deriv_eps):
+    def _ref_grazing(self, i, eps, graze_t_min, itx_eps):
         best, bracket = float("inf"), None
         for run in self._runs(i):
             mids = [0.5 * (a + b) for a, b in run]
@@ -273,13 +272,7 @@ class RaySdfSampledReferenceTests(unittest.TestCase):
         t = 0.5 * (lo + hi)
         p = self.o[i] + t * self.d[i]
         s = float(self.dual.sample_trilinear(p[None], self.sdf[:, None])[0, 0])
-        # Tangency from the gradient averaged over the bracket's two ends (the kernel's rule; the
-        # sampled scheme reads one side at t, which at a cell face is a coin flip).
-        ends = torch.stack([self.o[i] + lo * self.d[i], self.o[i] + hi * self.d[i]])
-        _, g = self.dual.sample_trilinear_with_grad(ends, self.sdf[:, None])
-        g = g[:, 0, :].mean(0)
-        tangent = abs(float((torch.nn.functional.normalize(g, dim=0) * self.d[i]).sum()))
-        return t if (itx_eps < s < eps and tangent < deriv_eps) else None
+        return t if itx_eps < s < eps else None
 
     def test_bisect_crossing_matches_reference(self):
         """Same hits as the reference on a smooth shell; t agrees to bisection precision.
@@ -299,11 +292,11 @@ class RaySdfSampledReferenceTests(unittest.TestCase):
         self.assertGreater(n_hit, 20, "fixture should produce hits")
 
     def test_bisect_grazing_matches_reference(self):
-        kw = dict(relaxation_eps=0.02, graze_t_min=1e-4, itx_eps=1e-7, deriv_eps=0.5)
+        kw = dict(relaxation_eps=0.02, graze_t_min=1e-4, itx_eps=1e-7)
         gr = self.dual.ray_sdf_grazing(self.sdf, self.o, self.d, graze="bisect", **kw)
         n_graze = 0
         for i in range(self.o.shape[0]):
-            ref = self._ref_grazing(i, kw["relaxation_eps"], kw["graze_t_min"], kw["itx_eps"], kw["deriv_eps"])
+            ref = self._ref_grazing(i, kw["relaxation_eps"], kw["graze_t_min"], kw["itx_eps"])
             self.assertEqual(bool(gr.mask[i]), ref is not None, f"ray {i}")
             if ref is not None:
                 n_graze += 1
@@ -312,7 +305,7 @@ class RaySdfSampledReferenceTests(unittest.TestCase):
 
     def test_combined_matches_separate_on_the_shell(self):
         """Combined and separate agree bit for bit in bisect/bisect, gaps in the band included."""
-        kw = dict(relaxation_eps=0.02, itx_eps=1e-7, deriv_eps=0.5)
+        kw = dict(relaxation_eps=0.02, itx_eps=1e-7)
         both = self.dual.ray_sdf_intersection_with_grazing(
             self.sdf, self.o, self.d, t_min=1e-4, graze_t_min=1e-4, refine="bisect", graze="bisect", **kw
         )
@@ -623,16 +616,12 @@ class RaySdfSolverModeTests(RaySdfTestCase):
         self.assertLess(float((hit.t - t_analytic).abs().max()), 1e-6)
 
     def test_bisect_grazing_agrees_with_analytic(self):
-        """Both grazing modes locate the same minimum, to bisection's resolution.
-
-        `deriv_eps` is deliberately loose here so this measures the *solvers* rather than the
-        acceptance gate; test_tangency_gate_is_face_sensitive covers the gate itself.
-        """
+        """Both grazing modes locate the same minimum, to bisection's resolution."""
         sdf = self.sphere_sdf(0.3)
         o, d = self._oblique_rays()
 
-        analytic = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.10, deriv_eps=0.5, graze="analytic")
-        bisect = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.10, deriv_eps=0.5, graze="bisect")
+        analytic = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.10, graze="analytic")
+        bisect = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.10, graze="bisect")
 
         torch.testing.assert_close(analytic.mask, bisect.mask)
         m = analytic.mask
@@ -662,45 +651,15 @@ class RaySdfSolverModeTests(RaySdfTestCase):
         self.assertLess(abs(float(analytic.t[0]) - float(bisect.t[0])), self.vx)
         self.assertAlmostEqual(float(analytic.sdf[0]), float(bisect.sdf[0]), delta=1e-4)
 
-    def test_tangency_gate_is_monotonic(self):
-        """Loosening the tangency gate can only add accepted points, never remove them.
-
-        Stated as monotonicity rather than as a specific accept/reject, because acceptance near
-        a voxel face is genuinely knife-edge: the interpolant is C0 but not C1, so
-        |normalize(grad) . d| jumps across a face, and which side a point lands on differs
-        between CPU and GPU rounding. An earlier version of this test asserted one particular
-        outcome and passed on CPU while failing on GPU for that reason alone.
-
-        The same sensitivity exists in any scheme that applies this test one-sided at a
-        bisected point, so a marginal grazing point can flip between iterations there too.
-        """
-        sdf = self.sphere_sdf(0.3)
-        ys = torch.linspace(0.30, 0.34, 24, device=self.device)
-        o = torch.stack([torch.full_like(ys, -0.6), ys, torch.full_like(ys, 0.013)], dim=1)
-        d = torch.zeros_like(o)
-        d[:, 0] = 1.0
-        d[:, 2] = 0.017
-        d = d / d.norm(dim=1, keepdim=True)
-
-        prev = None
-        for deriv_eps in (0.05, 0.1, 0.3, 1.0):
-            for graze in ("analytic", "bisect"):
-                got = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.10, deriv_eps=deriv_eps, graze=graze).mask
-                if graze == "analytic":
-                    if prev is not None:
-                        # every ray accepted at the tighter gate must still be accepted
-                        self.assertTrue(bool((prev & ~got).sum() == 0), f"deriv_eps={deriv_eps}")
-                    prev = got
-
     def test_analytic_grazing_accepts_only_minima(self):
         """Analytic must not accept far more rays than bisection does.
 
         A grazing point is a local minimum of the field along the ray. An earlier version of
-        the analytic mode minimised |SDF| over each cell's closed interval and left tangency
-        to the single gate at the end, which let a ray passing straight THROUGH a voxel face
-        be accepted: a cell endpoint sits exactly on a face, where the trilinear field is C0
-        but not C1, so the gate sees one of two one-sided gradients and can read a transversal
-        crossing as tangential. Small |SDF| on a face is not evidence of a minimum.
+        the analytic mode minimised |SDF| over each cell's closed interval and relied on a
+        tangency test at the end, which let a ray passing straight THROUGH a voxel face be
+        accepted: a cell endpoint sits exactly on a face, where the trilinear field is C0 but
+        not C1, so one of the two one-sided gradients can look tangent to a transversal
+        crossing. Small |SDF| on a face is not evidence of a minimum.
 
         Measured on a 256^2 sphere render, that accepted 32 rays where bisection accepted 14,
         inflating the relaxed-boundary term's gradient 2.2x and breaking a downstream
@@ -720,12 +679,8 @@ class RaySdfSolverModeTests(RaySdfTestCase):
         d[:, 2] = 0.013
         d = d / d.norm(dim=1, keepdim=True)
 
-        # deriv_eps is loose on purpose, so this measures the SOLVERS rather than the tangency
-        # gate. At the default 0.1 the gate binds on bisection's own points -- it accepts 45
-        # here but 101 at 0.5 -- because they sit near voxel faces where |grad.d| jumps. Using
-        # a gate-bound count as the reference would compare against a moving target.
-        analytic = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.02, deriv_eps=0.5, graze="analytic")
-        bisect = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.02, deriv_eps=0.5, graze="bisect")
+        analytic = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.02, graze="analytic")
+        bisect = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.02, graze="bisect")
 
         n_a, n_b = int(analytic.mask.sum()), int(bisect.mask.sum())
         self.assertGreater(n_b, 0, "fixture should produce grazing points")
@@ -734,32 +689,21 @@ class RaySdfSolverModeTests(RaySdfTestCase):
         )
         # Bounded from below too. These rays sweep the silhouette of a lattice-aligned sphere,
         # so many minima sit exactly on a voxel face -- the case this mode exists to resolve.
-        # Accepting none of them means the face path is broken, which is how the CPU/GPU split
-        # in the tangency gate first showed up (100 accepted on CPU, 0 on GPU).
+        # Accepting none of them means the face path is broken.
         self.assertGreaterEqual(
             n_a, 0.5 * n_b, f"analytic accepted {n_a} vs bisection's {n_b}: it is rejecting real minima"
         )
 
-    def test_grazing_rejects_crease_minimum(self):
-        """Tangency at a crease is judged by the averaged one-sided slopes.
+    def test_grazing_accepts_crease_minimum(self):
+        """A minimum on a crease is a grazing point, however lopsided the crease.
 
         |x - x0| + c with x0 on a lattice plane is reproduced exactly by trilinear interpolation,
         with the kink sitting on a cell face. A ray along +x has its SDF minimum, c, exactly on
-        that face. Two creases:
-
-          symmetric,  slopes -1 / +1:    the averaged slope is 0. The ray just touches the level
-                                         set phi = c from outside, which on a C0 surface is what a
-                                         silhouette looks like (the silhouette of a voxelised
-                                         surface runs along such creases); the relaxed-boundary
-                                         reference implementation's central-difference gradient
-                                         vanishes there and accepts it, and so do both modes here.
-          asymmetric, slopes -1 / +0.2:  the averaged slope is -0.4 of |grad|: the ray crosses
-                                         the crease rather than grazing it, and both modes reject.
-
-        Minima on faces are generic for a C0 interpolant, not an edge case; the rule was
-        measured against the relaxed-boundary reference implementation on real checkpoints,
-        where ~75% of its grazing points sit on faces and the earlier either-side rule lost
-        about half of them.
+        that face. Minima on faces are generic for a C0 interpolant, not an edge case: the
+        relaxed-boundary reference implementation's grazing points lie ~75% on faces. Whatever
+        the two slopes, the ray starts hitting the surface when c drops below zero, so both
+        modes accept the symmetric (-1 / +1) and the asymmetric (-1 / +0.2) crease. A kink
+        without a minimum (-1 / -0.2, the SDF keeps falling into a crossing) is not a graze.
         """
         x0 = 0.5 * self.vx  # a plane of corner positions, so the kink is on a cell face
         self.assertTrue(bool((self.corners[:, 0] - x0).abs().min() < 1e-6))
@@ -767,25 +711,15 @@ class RaySdfSolverModeTests(RaySdfTestCase):
         dx = self.corners[:, 0] - x0
         o = torch.tensor([[-0.4, 0.013, -0.021]], device=self.device)
         d = torch.tensor([[1.0, 0.0, 0.0]], device=self.device)
-        sdf_sym = dx.abs() + c
-        sdf_asym = torch.where(dx < 0, -dx, 0.2 * dx) + c
+        creases = {"symmetric": dx.abs() + c, "asymmetric": torch.where(dx < 0, -dx, 0.2 * dx) + c}
         for graze in ("analytic", "bisect"):
-            got = self.dual.ray_sdf_grazing(sdf_sym, o, d, relaxation_eps=0.04, graze=graze)
-            self.assertTrue(bool(got.mask[0]), f"graze={graze} rejected a symmetric crease minimum")
-            self.assertAlmostEqual(float(got.sdf[0]), c, delta=1e-4)
-            got = self.dual.ray_sdf_grazing(sdf_asym, o, d, relaxation_eps=0.04, graze=graze)
-            self.assertFalse(bool(got.mask[0]), f"graze={graze} accepted an asymmetric crease")
-
-        # Control: a GENTLE crease on the same face is accepted -- the rule tests the slope, not
-        # the face. The gate normalises by |grad|, so scaling the V down would change nothing;
-        # the gradient has to be mostly perpendicular to the ray instead. Adding (y - y_ray)
-        # gives grad = (+-0.05, 1, 0), a normalised along-ray slope of +-0.0499 (< deriv_eps
-        # 0.1), while leaving the SDF along the ray exactly 0.05|x - x0| + c.
-        y_ray = float(o[0, 1])
-        sdf_gentle = 0.05 * (self.corners[:, 0] - x0).abs() + (self.corners[:, 1] - y_ray) + c
-        got = self.dual.ray_sdf_grazing(sdf_gentle, o, d, relaxation_eps=0.04, graze="analytic")
-        self.assertTrue(bool(got.mask[0]), "a nearly-tangent face minimum should be accepted")
-        self.assertAlmostEqual(float(got.t[0]), x0 - float(o[0, 0]), delta=1e-4)
+            for name, sdf in creases.items():
+                got = self.dual.ray_sdf_grazing(sdf, o, d, relaxation_eps=0.04, graze=graze)
+                self.assertTrue(bool(got.mask[0]), f"graze={graze} rejected a {name} crease minimum")
+                self.assertAlmostEqual(float(got.sdf[0]), c, delta=1e-4)
+            no_min = torch.where(dx < 0, -dx, -0.2 * dx) + c
+            got = self.dual.ray_sdf_grazing(no_min, o, d, relaxation_eps=0.04, graze=graze)
+            self.assertFalse(bool(got.mask[0]), f"graze={graze} accepted a kink with no minimum")
 
     def test_invalid_mode_names_are_rejected(self):
         sdf = self.sphere_sdf(0.3)

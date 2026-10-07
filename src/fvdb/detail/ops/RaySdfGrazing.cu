@@ -18,7 +18,6 @@ raySdfGrazing(const GridBatchData &batchHdl,
               double grazeTMin,
               double relaxationEps,
               double itxEps,
-              double derivEps,
               double eps,
               int graze) {
     raysdf::checkListDims(rayOrigins, rayDirections, sdf);
@@ -37,7 +36,6 @@ raySdfGrazing(const GridBatchData &batchHdl,
             grazeTMin,
             relaxationEps,
             itxEps,
-            derivEps,
             eps);
     });
 }

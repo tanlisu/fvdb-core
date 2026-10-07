@@ -34,7 +34,6 @@ namespace ops {
 ///             absent the search runs to the end of the grid.
 /// @param rayMask Optional per-ray enable, shape (N,).
 /// @param grazeTMin Earliest accepted candidate; keeps the search off the ray origin.
-/// @param derivEps Tangency tolerance on |normalize(grad) . direction|.
 /// @return Slot 0 holds the grazing point; see RaySdfPointsResult.
 /// @param graze 0 = analytic quadratic (default), 1 = midpoint-pair bisection.
 RaySdfPointsResult raySdfGrazing(const GridBatchData &batchHdl,
@@ -46,7 +45,6 @@ RaySdfPointsResult raySdfGrazing(const GridBatchData &batchHdl,
                                  double grazeTMin,
                                  double relaxationEps,
                                  double itxEps,
-                                 double derivEps,
                                  double eps,
                                  int graze);
 

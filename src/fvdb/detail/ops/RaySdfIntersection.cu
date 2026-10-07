@@ -32,7 +32,6 @@ raySdfIntersection(const GridBatchData &batchHdl,
             0.0,
             0.0,
             0.0,
-            0.0,
             eps);
     });
 }

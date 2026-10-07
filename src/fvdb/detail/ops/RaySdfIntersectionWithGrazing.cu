@@ -17,7 +17,6 @@ raySdfIntersectionWithGrazing(const GridBatchData &batchHdl,
                               double grazeTMin,
                               double relaxationEps,
                               double itxEps,
-                              double derivEps,
                               double eps,
                               int refine,
                               int graze) {
@@ -36,7 +35,6 @@ raySdfIntersectionWithGrazing(const GridBatchData &batchHdl,
             grazeTMin,
             relaxationEps,
             itxEps,
-            derivEps,
             eps);
     });
 }

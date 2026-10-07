@@ -568,7 +568,6 @@ def ray_sdf_grazing_single(
     ray_mask: torch.Tensor | None = None,
     graze_t_min: float = 1e-4,
     itx_eps: float = 1e-7,
-    deriv_eps: float = 1e-1,
     eps: float = 1e-4,
     graze: str = "bisect",
 ) -> RaySdfPoint:
@@ -583,10 +582,12 @@ def ray_sdf_grazing_single(
     pass within ``relaxation_eps`` of the surface without hitting it, rather than exactly
     tangent rays. The boundary term weights each such point by ``-SDF / relaxation_eps``.
 
-    A candidate is accepted only when ``itx_eps < SDF < relaxation_eps`` and the surface is
-    near-tangent to the ray. The lower bound is not zero on purpose: ``SDF == 0`` is the
-    surface itself, so such a point is a tangential hit belonging to the interior term, and
-    testing against a bare zero lets rounding flip points between the two sets.
+    A candidate is accepted when ``itx_eps < SDF < relaxation_eps``. There is no separate tangency
+    test: every candidate is already a minimum along the ray, and one on a crease of the interpolant
+    at a cell face is as much a silhouette point as a smooth one. The lower bound is not zero on
+    purpose: ``SDF == 0`` is the surface itself, so such a point is a tangential hit belonging to
+    the interior term, and testing against a bare zero lets rounding flip points between the two
+    sets.
 
     Args:
         grid (Grid): The grid the SDF is stored on: the **dual** of the geometry grid, e.g.
@@ -604,16 +605,11 @@ def ray_sdf_grazing_single(
             origin. Default ``1e-4``.
         itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
             Default ``1e-7``.
-        deriv_eps (float): Tangency tolerance: a grazing point needs
-            ``|normalize(grad) . direction|`` below this. Default ``0.1``.
         eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
-        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
-            minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
-            judges tangency from the average of the gradients at the two ends of the final
-            bracket -- at a cell face that is the average of the two one-sided slopes, matching
-            the relaxed-boundary reference implementation's central-difference gradient) or
-            ``"analytic"`` (solves each cell's derivative quadratic exactly, including minima on
-            cell faces).
+        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the minimum
+            between adjacent cell midpoints and bisects 8 times on the sign of the along-ray slope,
+            read from the two cells' cubics) or ``"analytic"`` (solves each cell's derivative
+            quadratic exactly, including minima on cell faces).
 
     Returns:
         grazing (RaySdfPoint): The grazing point, its SDF value and gradient.
@@ -630,7 +626,6 @@ def ray_sdf_grazing_single(
         graze_t_min,
         relaxation_eps,
         itx_eps,
-        deriv_eps,
         eps,
         _mode(graze, _GRAZE_MODES, "graze"),
     )
@@ -656,7 +651,6 @@ def ray_sdf_intersection_with_grazing_single(
     t_min: float = 1e-4,
     graze_t_min: float = 1e-4,
     itx_eps: float = 1e-7,
-    deriv_eps: float = 1e-1,
     eps: float = 1e-4,
     refine: str = "bisect",
     graze: str = "bisect",
@@ -685,20 +679,15 @@ def ray_sdf_intersection_with_grazing_single(
             origin. Default ``1e-4``.
         itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
             Default ``1e-7``.
-        deriv_eps (float): Tangency tolerance: a grazing point needs
-            ``|normalize(grad) . direction|`` below this. Default ``0.1``.
         eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
         refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8 halvings
             on the sign of the cell's cubic, to 1/256 of the bracket) or ``"newton"`` (safeguarded
             Newton, to float precision). Both bracket every crossing from the cubic, so a surface
             thinner than a voxel is seen.
-        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
-            minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
-            judges tangency from the average of the gradients at the two ends of the final
-            bracket -- at a cell face that is the average of the two one-sided slopes, matching
-            the relaxed-boundary reference implementation's central-difference gradient) or
-            ``"analytic"`` (solves each cell's derivative quadratic exactly, including minima on
-            cell faces).
+        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the minimum
+            between adjacent cell midpoints and bisects 8 times on the sign of the along-ray slope,
+            read from the two cells' cubics) or ``"analytic"`` (solves each cell's derivative
+            quadratic exactly, including minima on cell faces).
 
     Returns:
         points (RaySdfPoints): ``.crossing`` and ``.grazing``, each a
@@ -715,7 +704,6 @@ def ray_sdf_intersection_with_grazing_single(
         graze_t_min,
         relaxation_eps,
         itx_eps,
-        deriv_eps,
         eps,
         _mode(refine, _REFINE_MODES, "refine"),
         _mode(graze, _GRAZE_MODES, "graze"),
@@ -824,7 +812,6 @@ def ray_sdf_grazing_batch(
     ray_mask: JaggedTensor | None = None,
     graze_t_min: float = 1e-4,
     itx_eps: float = 1e-7,
-    deriv_eps: float = 1e-1,
     eps: float = 1e-4,
     graze: str = "bisect",
 ) -> RaySdfPoint:
@@ -846,16 +833,11 @@ def ray_sdf_grazing_batch(
             origin. Default ``1e-4``.
         itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
             Default ``1e-7``.
-        deriv_eps (float): Tangency tolerance: a grazing point needs
-            ``|normalize(grad) . direction|`` below this. Default ``0.1``.
         eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
-        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
-            minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
-            judges tangency from the average of the gradients at the two ends of the final
-            bracket -- at a cell face that is the average of the two one-sided slopes, matching
-            the relaxed-boundary reference implementation's central-difference gradient) or
-            ``"analytic"`` (solves each cell's derivative quadratic exactly, including minima on
-            cell faces).
+        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the minimum
+            between adjacent cell midpoints and bisects 8 times on the sign of the along-ray slope,
+            read from the two cells' cubics) or ``"analytic"`` (solves each cell's derivative
+            quadratic exactly, including minima on cell faces).
 
     Returns:
         grazing (RaySdfPoint): Fields are :class:`JaggedTensor` rather than ``torch.Tensor``.
@@ -872,7 +854,6 @@ def ray_sdf_grazing_batch(
         graze_t_min,
         relaxation_eps,
         itx_eps,
-        deriv_eps,
         eps,
         _mode(graze, _GRAZE_MODES, "graze"),
     )
@@ -897,7 +878,6 @@ def ray_sdf_intersection_with_grazing_batch(
     t_min: float = 1e-4,
     graze_t_min: float = 1e-4,
     itx_eps: float = 1e-7,
-    deriv_eps: float = 1e-1,
     eps: float = 1e-4,
     refine: str = "bisect",
     graze: str = "bisect",
@@ -917,20 +897,15 @@ def ray_sdf_intersection_with_grazing_batch(
             origin. Default ``1e-4``.
         itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
             Default ``1e-7``.
-        deriv_eps (float): Tangency tolerance: a grazing point needs
-            ``|normalize(grad) . direction|`` below this. Default ``0.1``.
         eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
         refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8 halvings
             on the sign of the cell's cubic, to 1/256 of the bracket) or ``"newton"`` (safeguarded
             Newton, to float precision). Both bracket every crossing from the cubic, so a surface
             thinner than a voxel is seen.
-        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
-            minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
-            judges tangency from the average of the gradients at the two ends of the final
-            bracket -- at a cell face that is the average of the two one-sided slopes, matching
-            the relaxed-boundary reference implementation's central-difference gradient) or
-            ``"analytic"`` (solves each cell's derivative quadratic exactly, including minima on
-            cell faces).
+        graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the minimum
+            between adjacent cell midpoints and bisects 8 times on the sign of the along-ray slope,
+            read from the two cells' cubics) or ``"analytic"`` (solves each cell's derivative
+            quadratic exactly, including minima on cell faces).
 
     Returns:
         points (RaySdfPoints): ``.crossing`` and ``.grazing``, whose fields are
@@ -947,7 +922,6 @@ def ray_sdf_intersection_with_grazing_batch(
         graze_t_min,
         relaxation_eps,
         itx_eps,
-        deriv_eps,
         eps,
         _mode(refine, _REFINE_MODES, "refine"),
         _mode(graze, _GRAZE_MODES, "graze"),

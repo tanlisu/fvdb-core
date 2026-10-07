@@ -43,8 +43,10 @@ namespace raysdf {
 //                        sphere tracer does not, and the cubic bracket matches its hits.)
 //   GrazeMode::Analytic  minima of the per-cell cubic, including minima on cell faces.
 //   GrazeMode::Bisect    midpoint derivative pairs of adjacent voxels, bisected 8 times on the
-//                        derivative's sign. Tangency is then judged from the gradient averaged
-//                        over the two ends of the final bracket, see the gate.
+//                        sign of the along-ray slope, read from the two cells' cubics.
+//
+//   Either way the grazing candidate is a local minimum of the SDF along the ray, and it is
+//   accepted when its value lies in (itxEps, relaxationEps); see the acceptance note below.
 //
 // Bisect is the default for both and the mode used in practice; Newton and Analytic are exact
 // alternatives kept for comparison and have not been validated as far in optimisation.
@@ -64,7 +66,6 @@ template <typename MathType> struct SurfacePointParams {
     MathType grazeTMin;     // earliest accepted grazing candidate
     MathType relaxationEps; // upper edge of the band a grazing point must sit in
     MathType itxEps;        // lower edge of that band; see the acceptance note below
-    MathType derivEps;      // tangency tolerance at the grazing point
     MathType eps;           // skip cells whose ray segment is shorter than this
 };
 
@@ -411,10 +412,16 @@ raySdfPointsCallback(int32_t bidx,
     MathType braMinT     = MathType(0);
     MathType braMaxT     = MathType(0);
     bool haveBracket     = false;
-    // Gradients at the two ends of the bisected bracket, as read by the probes that set them.
-    MathType grazeGLo[3] = {MathType(0), MathType(0), MathType(0)};
-    MathType grazeGHi[3] = {MathType(0), MathType(0), MathType(0)};
-    bool grazeHaveEnds   = false;
+    // The bracket runs from the previous cell's midpoint to this cell's, so it spans exactly two
+    // cells whose cubics are already known. Both are kept with the bracket, each with its entry
+    // time (the cubic's tau origin); the second entry time is also the face between them. The
+    // bisection reads its slopes from these cubics and never resolves the stencil.
+    CellCubic<MathType> prevCubic  = {MathType(0), MathType(0), MathType(0), MathType(0)};
+    MathType prevT0                = MathType(0);
+    CellCubic<MathType> braCubicLo = prevCubic;
+    CellCubic<MathType> braCubicHi = prevCubic;
+    MathType braT0Lo               = MathType(0);
+    MathType braT0Hi               = MathType(0);
 
     // The previous cell, for everything that pairs a cell with its neighbour. Its exit t says
     // whether the two are adjacent: across a gap in the band nothing is defined, so no grazing
@@ -427,12 +434,6 @@ raySdfPointsCallback(int32_t bidx,
     bool foundGrazing   = false;
     MathType tGrazing   = MathType(0);
     MathType bestAbsSdf = std::numeric_limits<MathType>::infinity();
-    // Set when the winning candidate sits exactly ON a cell face, together with the along-ray
-    // derivatives on the two sides of that face; the tangency gate uses them there in place of
-    // the 3D gradient, which is discontinuous at a face. See the gate for why.
-    bool grazingOnFace          = false;
-    MathType grazingApproachDrv = MathType(0);
-    MathType grazingLeaveDrv    = MathType(0);
 
     for (auto it = HDDAActiveValueIterator<decltype(gridAcc), MathType>(rayVox, gridAcc);
          it.isValid();
@@ -516,8 +517,8 @@ raySdfPointsCallback(int32_t bidx,
             // Sample the derivative at this voxel's midpoint, pair it with the previous
             // midpoint, and keep pairs where the ray stops approaching and starts receding.
             // Selection is by the smaller |SDF| of the pair, i.e. the pair whose samples come
-            // closest to the surface. The winning bracket is bisected once after the march, so the
-            // expensive stencil probes are paid per ray rather than per voxel.
+            // closest to the surface. The winning bracket is bisected once after the march, on
+            // the two cells' cubics, which are saved with it.
             //
             // A minimum sitting exactly on a voxel face is still found: the bracket runs
             // midpoint to midpoint and so straddles the face, never reading the derivative
@@ -527,8 +528,8 @@ raySdfPointsCallback(int32_t bidx,
             const MathType midDrv = c.deriv(tauMid);
             const MathType midAbs = nanovdb::math::Abs(c.value(tauMid));
 
-            // Adjacent voxels only: a bracket across a gap would be bisected where the field is
-            // undefined, and the final evaluation there reads missing corners as zero.
+            // Adjacent voxels only: across a gap neither cubic describes the field between the
+            // two midpoints, and the final evaluation there reads missing corners as zero.
             if (havePrevMid && contiguous && prevMidDrv <= MathType(0) && midDrv > MathType(0)) {
                 const MathType key = (prevMidAbsS < midAbs) ? prevMidAbsS : midAbs;
                 if (prevMidT >= p.grazeTMin && midT <= tMaxRay && key < bestAbsSdf &&
@@ -536,6 +537,10 @@ raySdfPointsCallback(int32_t bidx,
                     bestAbsSdf   = key;
                     braMinT      = prevMidT;
                     braMaxT      = midT;
+                    braCubicLo   = prevCubic;
+                    braT0Lo      = prevT0;
+                    braCubicHi   = c;
+                    braT0Hi      = t0;
                     haveBracket  = true;
                     foundGrazing = true;
                 }
@@ -544,6 +549,8 @@ raySdfPointsCallback(int32_t bidx,
             prevMidT    = midT;
             prevMidDrv  = midDrv;
             prevMidAbsS = midAbs;
+            prevCubic   = c;
+            prevT0      = t0;
         }
 
         if constexpr (WantGrazing && Graze == GrazeMode::Analytic) {
@@ -551,13 +558,13 @@ raySdfPointsCallback(int32_t bidx,
             // approaching the surface and starts receding. Candidates must satisfy that, not
             // merely have a small |SDF|.
             //
-            // An earlier version minimised s over the closed interval [0, dt] and left the
-            // tangency test to the single gate at the end. That over-accepts badly (measured:
-            // 32 rays against bisect's 14 on a 256^2 sphere render, inflating the boundary
-            // gradient 2.2x), because a cell endpoint lies exactly ON a voxel face, where the
-            // trilinear field is C0 but not C1. The gate evaluates one of the two one-sided
-            // gradients there, so a ray passing straight through a face can be mistaken for a
-            // tangency. Small |s| on a face is not evidence of anything.
+            // An earlier version minimised s over the closed interval [0, dt] and relied on a
+            // tangency test at the end. That over-accepts badly (measured: 32 rays against
+            // bisect's 14 on a 256^2 sphere render, inflating the boundary gradient 2.2x),
+            // because a cell endpoint lies exactly ON a voxel face, where the trilinear field
+            // is C0 but not C1: one of the two one-sided gradients there can look tangent while
+            // the ray passes straight through the face with no minimum. Small |s| on a face is
+            // not evidence of anything; only a minimum is.
             //
             // The two candidate kinds are therefore tested differently:
             //
@@ -608,14 +615,9 @@ raySdfPointsCallback(int32_t bidx,
                 }
                 const MathType absS = nanovdb::math::Abs(c.value(tau));
                 if (absS < bestAbsSdf) {
-                    bestAbsSdf    = absS;
-                    tGrazing      = t;
-                    foundGrazing  = true;
-                    grazingOnFace = onFace;
-                    // prevExitDrv is the previous cell's derivative at this shared face and
-                    // entryDrv this cell's: the two one-sided slopes.
-                    grazingApproachDrv = onFace ? prevExitDrv : MathType(0);
-                    grazingLeaveDrv    = onFace ? entryDrv : MathType(0);
+                    bestAbsSdf   = absS;
+                    tGrazing     = t;
+                    foundGrazing = true;
                 }
             }
         }
@@ -646,44 +648,29 @@ raySdfPointsCallback(int32_t bidx,
     };
 
     if constexpr (WantGrazing && Graze == GrazeMode::Bisect) {
-        // Bisect the winning midpoint-to-midpoint bracket on the derivative's sign, 8 steps.
-        // The bracket straddles a voxel face, so each probe has to resolve the
-        // stencil rather than evaluate a polynomial.
+        // Bisect the winning midpoint-to-midpoint bracket on the sign of the along-ray slope, 8
+        // steps. The bracket straddles the face between two cells, and on either side the slope
+        // is that cell's cubic differentiated -- the same number as the stencil gradient dotted
+        // with the ray, without resolving the stencil. A probe landing exactly on the face is
+        // assigned to the second cell, so which side it reads is fixed rather than left to
+        // rounding (resolving the stencil there made CPU and GPU disagree).
         if (haveBracket) {
-            // Each probe's full gradient is kept with the end it moves, so the gate below sees
-            // exactly the gradients the sign decisions were made with. Re-evaluating at the
-            // final ends instead would resolve a probe sitting on a cell face to whichever side
-            // rounding lands on at that call site -- measured: CPU and GPU disagreed.
+            auto slopeAt = [&](MathType t) -> MathType {
+                return (t < braT0Hi) ? braCubicLo.deriv(t - braT0Lo)
+                                     : braCubicHi.deriv(t - braT0Hi);
+            };
             MathType lo = braMinT, hi = braMaxT;
-            MathType v, gL[3], gH[3];
-            bool okL = evalAt(lo, v, gL);
-            bool okH = evalAt(hi, v, gH);
             for (int i = 0; i < 8; ++i) {
                 const MathType mid = MathType(0.5) * (lo + hi);
-                MathType gM[3];
-                const bool okM = evalAt(mid, v, gM);
-                const MathType dM =
-                    okM ? gM[0] * dVox[0] + gM[1] * dVox[1] + gM[2] * dVox[2] : MathType(0);
-                if (dM < MathType(0)) {
-                    lo  = mid;
-                    okL = okM;
-                    for (int k = 0; k < 3; ++k) {
-                        gL[k] = gM[k];
-                    }
+                if (slopeAt(mid) < MathType(0)) {
+                    lo = mid;
                 } else {
-                    hi  = mid;
-                    okH = okM;
-                    for (int k = 0; k < 3; ++k) {
-                        gH[k] = gM[k];
-                    }
+                    hi = mid;
                 }
             }
-            tGrazing      = MathType(0.5) * (lo + hi);
-            grazeHaveEnds = okL && okH;
-            for (int k = 0; k < 3; ++k) {
-                grazeGLo[k] = gL[k];
-                grazeGHi[k] = gH[k];
-            }
+            // The bracket keeps slope <= 0 at lo and >= 0 at hi, so it always holds a local
+            // minimum (an interior one with zero slope, or a crease on the face).
+            tGrazing = MathType(0.5) * (lo + hi);
         }
     }
 
@@ -711,87 +698,15 @@ raySdfPointsCallback(int32_t bidx,
                 return;
             }
 
-            const MathType gLen =
-                nanovdb::math::Sqrt(grad[0] * grad[0] + grad[1] * grad[1] + grad[2] * grad[2]);
-            // The gate asks whether the ray is (nearly) tangent to the level set, i.e. whether
-            // |grad . d| / |grad| is below derivEps. At an interior critical point the along-ray
-            // derivative is zero by construction and the gate is vacuous on it (it still guards
-            // near-degenerate gradients).
-            //
-            // A minimum sitting exactly ON a cell face needs care, because the trilinear field is
-            // C0 but not C1 there: the along-ray derivative jumps, and a face minimum is generic,
-            // not rare -- any time the derivative jumps from negative to positive across a face,
-            // i.e. the ray crosses a CREASE of the interpolant. Two wrong answers were tried:
-            //
-            //   evaluating grad at the face point  -- evalAt resolves the stencil to whichever
-            //       side rounding lands on, so the gate flips a coin (measured: one fixture
-            //       accepted 100 points on CPU and 0 on GPU at the same threshold);
-            //   skipping the gate for face minima  -- admits every crease the ray crosses,
-            //       however steep. On a chair mid-training that accepted 2-3x the grazing points
-            //       a midpoint-sampled search does, almost all of them creases with one-sided
-            //       slopes of 0.2-0.4, and inflated the boundary gradient accordingly.
-            //
-            // The rule: a face minimum is judged by the AVERAGE of the two one-sided slopes,
-            // which is what a central finite difference of the field measures at a face -- the
-            // gradient the relaxed-boundary reference implementation's gate sees. On a C0
-            // surface the silhouette runs along
-            // the creases of the level set, where a grazing ray sees slopes of opposite sign and
-            // similar size; that averages to (near) zero and is accepted, while a ray crossing
-            // a steep asymmetric crease is not. (Measured against that implementation on real
-            // checkpoints: its grazing points lie ~75% on cell faces, and the earlier
-            // either-side rule -- accept only if one side is flat -- rejected about half of
-            // them.) An interior critical point has a continuous gradient, so there the two
-            // sides coincide and the rule reduces to the plain test.
-            if (gLen > MathType(0)) {
-                MathType dirDeriv;
-                if constexpr (Graze == GrazeMode::Bisect) {
-                    // The bisected bracket straddles the minimum. When the minimum sits on a cell
-                    // face -- generic on a C0 field, see above -- its two ends lie in different
-                    // cells and carry the two one-sided gradients; when it is interior they carry
-                    // the same one. Judge tangency from their AVERAGE: that is what a central
-                    // finite difference of the field measures at a face, i.e. what
-                    // the relaxed-boundary reference implementation's gate sees, and it reduces
-                    // to the plain test inside a cell. (Reading one side at the bisected point
-                    // instead makes a crease pass or fail by which side rounding lands on.) The
-                    // end gradients are the ones the bisection's own probes read, see there.
-                    // Normalised by the mean of the two end gradients' lengths, not by the
-                    // length of their average: at a symmetric crease the average is a rounding
-                    // residual, and normalising it would turn that residual into a unit vector
-                    // along the ray (measured: CPU and GPU each rejected a symmetric crease on
-                    // different axes). For a well-conditioned minimum the two coincide.
-                    MathType gAvg[3] = {grad[0], grad[1], grad[2]};
-                    MathType nLen    = gLen;
-                    if (grazeHaveEnds) {
-                        for (int k = 0; k < 3; ++k) {
-                            gAvg[k] = MathType(0.5) * (grazeGLo[k] + grazeGHi[k]);
-                        }
-                        nLen = MathType(0.5) * (nanovdb::math::Sqrt(grazeGLo[0] * grazeGLo[0] +
-                                                                    grazeGLo[1] * grazeGLo[1] +
-                                                                    grazeGLo[2] * grazeGLo[2]) +
-                                                nanovdb::math::Sqrt(grazeGHi[0] * grazeGHi[0] +
-                                                                    grazeGHi[1] * grazeGHi[1] +
-                                                                    grazeGHi[2] * grazeGHi[2]));
-                    }
-                    dirDeriv = (nLen > MathType(0)) ? (gAvg[0] * static_cast<MathType>(rayD[0]) +
-                                                       gAvg[1] * static_cast<MathType>(rayD[1]) +
-                                                       gAvg[2] * static_cast<MathType>(rayD[2])) /
-                                                          nLen
-                                                    : MathType(0);
-                } else if (grazingOnFace) {
-                    // Same rule for the analytic path's face minima, from the two cells' own
-                    // cubics: the averaged one-sided slope.
-                    dirDeriv = MathType(0.5) * (grazingApproachDrv + grazingLeaveDrv) / gLen;
-                } else {
-                    dirDeriv = (grad[0] * static_cast<MathType>(rayD[0]) +
-                                grad[1] * static_cast<MathType>(rayD[1]) +
-                                grad[2] * static_cast<MathType>(rayD[2])) /
-                               gLen;
-                }
-                if (nanovdb::math::Abs(dirDeriv) >= p.derivEps) {
-                    return;
-                }
-            }
-
+            // No slope (tangency) test. Both modes only produce local minima of the SDF along
+            // the ray, and the relaxed boundary term counts the rays whose minimum lies in
+            // (itxEps, relaxationEps): as the field changes, the ray starts or stops hitting the
+            // surface when that minimum crosses zero, whether the minimum is smooth or sits on
+            // a crease of the trilinear field at a cell face (C0 but not C1 there, so creases
+            // are generic). A threshold on the averaged one-sided slopes rejected crease minima
+            // with lopsided slopes -- measured against the relaxed-boundary reference
+            // implementation, whose grazing points lie ~75% on cell faces, we accepted about
+            // half as many points and its boundary gradient was ~1.8x ours.
             writeSlot(kGrazingSlot, tGrazing, val, grad);
         }
     }
@@ -859,7 +774,6 @@ launch(const GridBatchData &batchHdl,
        double grazeTMin,
        double relaxationEps,
        double itxEps,
-       double derivEps,
        double eps) {
     checkCommonArgs(batchHdl, rayOrigins, rayDirections, sdf);
     TORCH_CHECK_VALUE(eps >= 0.0, "eps must be positive or zero");
@@ -898,7 +812,6 @@ launch(const GridBatchData &batchHdl,
                            static_cast<MathType>(grazeTMin),
                            static_cast<MathType>(relaxationEps),
                            static_cast<MathType>(itxEps),
-                           static_cast<MathType>(derivEps),
                            static_cast<MathType>(eps),
                        };
 

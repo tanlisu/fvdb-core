@@ -1355,7 +1355,6 @@ class GridBatch:
         ray_mask: JaggedTensor | None = None,
         graze_t_min: float = 1e-4,
         itx_eps: float = 1e-7,
-        deriv_eps: float = 1e-1,
         eps: float = 1e-4,
         graze: str = "bisect",
     ) -> "functional.RaySdfPoint":
@@ -1381,16 +1380,11 @@ class GridBatch:
                 origin. Default ``1e-4``.
             itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
                 Default ``1e-7``.
-            deriv_eps (float): Tangency tolerance: a grazing point needs
-                ``|normalize(grad) . direction|`` below this. Default ``0.1``.
             eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
-            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
-                minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
-                judges tangency from the average of the gradients at the two ends of the final
-                bracket -- at a cell face that is the average of the two one-sided slopes,
-                matching the relaxed-boundary reference implementation's central-difference
-                gradient) or ``"analytic"`` (solves each cell's derivative quadratic exactly,
-                including minima on cell faces).
+            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the minimum
+                between adjacent cell midpoints and bisects 8 times on the sign of the along-ray
+                slope, read from the two cells' cubics) or ``"analytic"`` (solves each cell's
+                derivative quadratic exactly, including minima on cell faces).
 
         .. seealso:: :meth:`Grid.ray_sdf_grazing`
         """
@@ -1406,7 +1400,6 @@ class GridBatch:
             ray_mask,
             graze_t_min,
             itx_eps,
-            deriv_eps,
             eps,
             graze,
         )
@@ -1420,7 +1413,6 @@ class GridBatch:
         t_min: float = 1e-4,
         graze_t_min: float = 1e-4,
         itx_eps: float = 1e-7,
-        deriv_eps: float = 1e-1,
         eps: float = 1e-4,
         refine: str = "bisect",
         graze: str = "bisect",
@@ -1444,20 +1436,15 @@ class GridBatch:
                 origin. Default ``1e-4``.
             itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
                 Default ``1e-7``.
-            deriv_eps (float): Tangency tolerance: a grazing point needs
-                ``|normalize(grad) . direction|`` below this. Default ``0.1``.
             eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
             refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8
                 halvings on the sign of the cell's cubic, to 1/256 of the bracket) or
                 ``"newton"`` (safeguarded Newton, to float precision). Both bracket every
                 crossing from the cubic, so a surface thinner than a voxel is seen.
-            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
-                minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
-                judges tangency from the average of the gradients at the two ends of the final
-                bracket -- at a cell face that is the average of the two one-sided slopes,
-                matching the relaxed-boundary reference implementation's central-difference
-                gradient) or ``"analytic"`` (solves each cell's derivative quadratic exactly,
-                including minima on cell faces).
+            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the minimum
+                between adjacent cell midpoints and bisects 8 times on the sign of the along-ray
+                slope, read from the two cells' cubics) or ``"analytic"`` (solves each cell's
+                derivative quadratic exactly, including minima on cell faces).
 
         .. seealso:: :meth:`Grid.ray_sdf_intersection_with_grazing`
         """
@@ -1472,7 +1459,6 @@ class GridBatch:
             t_min,
             graze_t_min,
             itx_eps,
-            deriv_eps,
             eps,
             refine,
             graze,

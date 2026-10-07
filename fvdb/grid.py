@@ -1310,7 +1310,6 @@ class Grid:
         ray_mask: torch.Tensor | None = None,
         graze_t_min: float = 1e-4,
         itx_eps: float = 1e-7,
-        deriv_eps: float = 1e-1,
         eps: float = 1e-4,
         graze: str = "bisect",
     ) -> "functional.RaySdfPoint":
@@ -1320,9 +1319,10 @@ class Grid:
         passes within ``relaxation_eps`` of the surface without hitting it, rather than an
         exactly tangent ray. The boundary term weights it by ``-SDF / relaxation_eps``.
 
-        The local minimum of the SDF along the ray, i.e. where the directional derivative
-        crosses zero from negative to positive, accepted only when it lies inside the
-        relaxation band and the surface is near-tangent to the ray.
+        The local minimum of the SDF along the ray, i.e. where the directional derivative crosses
+        zero from negative to positive, accepted when its SDF lies inside the relaxation band. There
+        is no separate tangency test: a minimum on a crease of the interpolant (a cell face, where
+        it is C0 but not C1) is as much a silhouette point as a smooth one.
 
         .. note:: ``self`` must be the dual grid; see :meth:`ray_sdf_intersection`.
 
@@ -1340,16 +1340,11 @@ class Grid:
                 origin. Default ``1e-4``.
             itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
                 Default ``1e-7``.
-            deriv_eps (float): Tangency tolerance: a grazing point needs
-                ``|normalize(grad) . direction|`` below this. Default ``0.1``.
             eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
-            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
-                minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
-                judges tangency from the average of the gradients at the two ends of the final
-                bracket -- at a cell face that is the average of the two one-sided slopes,
-                matching the relaxed-boundary reference implementation's central-difference
-                gradient) or ``"analytic"`` (solves each cell's derivative quadratic exactly,
-                including minima on cell faces).
+            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the minimum
+                between adjacent cell midpoints and bisects 8 times on the sign of the along-ray
+                slope, read from the two cells' cubics) or ``"analytic"`` (solves each cell's
+                derivative quadratic exactly, including minima on cell faces).
 
         Returns:
             grazing (RaySdfPoint): Grazing parameter, mask, position, SDF and gradient.
@@ -1368,7 +1363,6 @@ class Grid:
             ray_mask,
             graze_t_min,
             itx_eps,
-            deriv_eps,
             eps,
             graze,
         )
@@ -1382,7 +1376,6 @@ class Grid:
         t_min: float = 1e-4,
         graze_t_min: float = 1e-4,
         itx_eps: float = 1e-7,
-        deriv_eps: float = 1e-1,
         eps: float = 1e-4,
         refine: str = "bisect",
         graze: str = "bisect",
@@ -1411,20 +1404,15 @@ class Grid:
                 origin. Default ``1e-4``.
             itx_eps (float): Lower edge of the band: a smaller SDF counts as a hit, not a graze.
                 Default ``1e-7``.
-            deriv_eps (float): Tangency tolerance: a grazing point needs
-                ``|normalize(grad) . direction|`` below this. Default ``0.1``.
             eps (float): Skip cells whose ray segment is shorter than this. Default ``1e-4``.
             refine (str): How a bracketed crossing is refined: ``"bisect"`` (default; 8
                 halvings on the sign of the cell's cubic, to 1/256 of the bracket) or
                 ``"newton"`` (safeguarded Newton, to float precision). Both bracket every
                 crossing from the cubic, so a surface thinner than a voxel is seen.
-            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the
-                minimum between adjacent cell midpoints, bisects 8 times on the derivative's sign, and
-                judges tangency from the average of the gradients at the two ends of the final
-                bracket -- at a cell face that is the average of the two one-sided slopes,
-                matching the relaxed-boundary reference implementation's central-difference
-                gradient) or ``"analytic"`` (solves each cell's derivative quadratic exactly,
-                including minima on cell faces).
+            graze (str): How the grazing point is found: ``"bisect"`` (default; brackets the minimum
+                between adjacent cell midpoints and bisects 8 times on the sign of the along-ray
+                slope, read from the two cells' cubics) or ``"analytic"`` (solves each cell's
+                derivative quadratic exactly, including minima on cell faces).
 
         Returns:
             points (RaySdfPoints): ``.crossing`` and ``.grazing``.
@@ -1442,7 +1430,6 @@ class Grid:
             t_min,
             graze_t_min,
             itx_eps,
-            deriv_eps,
             eps,
             refine,
             graze,
